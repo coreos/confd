@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
@@ -20,15 +21,19 @@ import (
 )
 
 const (
-	ipPool         = "/calico/v1/ipam/v4/pool"
-	global         = "/calico/bgp/v1/global"
-	globalASN      = "/calico/bgp/v1/global/as_num"
-	globalNodeMesh = "/calico/bgp/v1/global/node_mesh"
-	allNodes       = "/calico/bgp/v1/host"
-	globalLogging  = "/calico/bgp/v1/global/loglevel"
+	ipPool               = "/calico/v1/ipam/v4/pool"
+	global               = "/calico/bgp/v1/global"
+	globalASN            = "/calico/bgp/v1/global/as_num"
+	globalNodeMesh       = "/calico/bgp/v1/global/node_mesh"
+	allNodes             = "/calico/bgp/v1/host"
+	subnetNodes          = "/calico/bgp/v1/subnet/host"
+	reflectorNodes       = "/calico/bgp/v1/reflector/host"
+	subnetReflectorNodes = "/calico/bgp/v1/subnet/reflector/host"
+	globalLogging        = "/calico/bgp/v1/global/loglevel"
 )
 
 var (
+	nodesList  = regexp.MustCompile("^/calico/bgp/v1/host")
 	singleNode = regexp.MustCompile("^/calico/bgp/v1/host/([a-zA-Z0-9._-]*)$")
 	ipBlock    = regexp.MustCompile("^/calico/ipam/v2/host/([a-zA-Z0-9._-]*)/ipv4/block")
 )
@@ -90,6 +95,36 @@ func NewK8sClient(kubeconfig string) (*Client, error) {
 	}
 
 	return kubeClient, nil
+}
+
+func (c *Client) fetchThisNode() (*kapiv1.Node, error) {
+	nodeName := os.Getenv("NODENAME")
+	if nodeName == "" {
+		return nil, fmt.Errorf("Could not determine Kubernetes node name via NODENAME environment variable. Subnet reflectors will not work!")
+	}
+	return c.clientSet.Nodes().Get(nodeName, metav1.GetOptions{})
+}
+
+func (c *Client) fetchNodes(vars map[string]string, matchLabels map[string]string) error {
+
+	clauses := []string{}
+	for key, value := range matchLabels {
+		clauses = append(clauses, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	listOptions := metav1.ListOptions{LabelSelector: strings.Join(clauses, ",")}
+	nodes, err := c.clientSet.Nodes().List(listOptions)
+	if err != nil {
+		return err
+	}
+
+	for _, kNode := range nodes.Items {
+		err := c.populateNodeDetails(&kNode, vars)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // GetValues takes the etcd like keys and route it to the appropriate k8s API endpoint.
@@ -157,21 +192,53 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 			}
 			c.populateFromKVPairs(kvps, vars)
 		case allNodes:
-			nodes, err := c.clientSet.Nodes().List(metav1.ListOptions{})
+			if err := c.fetchNodes(vars, nil); err != nil {
+				return nil, err
+			}
+		case subnetNodes:
+			thisNode, err := c.fetchThisNode()
 			if err != nil {
 				return nil, err
 			}
-
-			for _, kNode := range nodes.Items {
-				err := c.populateNodeDetails(&kNode, vars)
-				if err != nil {
-					return nil, err
-				}
+			tmpVars := make(map[string]string)
+			if err := c.fetchNodes(tmpVars, map[string]string{
+				resources.NodeBgpIpv4NetworkLabel: thisNode.Labels[resources.NodeBgpIpv4NetworkLabel],
+			}); err != nil {
+				return nil, err
 			}
+			mungeHostKeyPath(tmpVars, vars, subnetNodes)
+		case reflectorNodes:
+			tmpVars := make(map[string]string)
+			if err := c.fetchNodes(tmpVars, map[string]string{
+				resources.NodeBgpReflectorLabel: "subnet",
+			}); err != nil {
+				return nil, err
+			}
+			mungeHostKeyPath(tmpVars, vars, reflectorNodes)
+		case subnetReflectorNodes:
+			thisNode, err := c.fetchThisNode()
+			if err != nil {
+				return nil, err
+			}
+			tmpVars := make(map[string]string)
+			if err := c.fetchNodes(tmpVars, map[string]string{
+				resources.NodeBgpReflectorLabel:   "subnet",
+				resources.NodeBgpIpv4NetworkLabel: thisNode.Labels[resources.NodeBgpIpv4NetworkLabel],
+			}); err != nil {
+				return nil, err
+			}
+			mungeHostKeyPath(tmpVars, vars, subnetReflectorNodes)
 		}
 	}
 	log.Debug(fmt.Sprintf("%v", vars))
 	return vars, nil
+}
+
+func mungeHostKeyPath(newVars, vars map[string]string, targetPath string) {
+	for key, val := range newVars {
+		targetKey := strings.Replace(key, allNodes, targetPath, 1)
+		vars[targetKey] = val
+	}
 }
 
 // WatchPrefix is not implemented - K8s backend only supports interval watches.
